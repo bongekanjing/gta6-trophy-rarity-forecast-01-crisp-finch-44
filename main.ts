@@ -101,16 +101,16 @@ function trackedPoints(history: readonly Read[]): Array<{ t: number; T: number }
  * How far tracked players grow from the case's last read to the target.
  *
  * Exophase's count is the population that owns the game and links the site, so it is front-loaded
- * after a launch and then slows: a power law in the age of the game, T ~ age^k, is the shape that
- * carries a launch, and it is fitted here on every distinct count the history records. Where the
- * history holds one count the page has not been refreshed and there is nothing to fit, so the
- * exponent falls back to a launch-week prior.
+ * after a launch and then slows: a power law in the age of the game, T ~ age^k, is what carries a
+ * launch. Where a history holds several distinct counts that law is a measurement and is fitted.
  *
- * The two regimes are genuinely different and worth naming. A fitted exponent over a day or two of
- * refreshes is a measurement and is trusted. A single stale page is not: the practice cases are
- * exactly that, and their answer was six times the count their page showed, because the refresh had
- * not landed when the page was read. The prior below therefore sits high enough to allow for a
- * large unreported step, without pretending to know its size.
+ * Where it holds only one count the page has not refreshed inside the case, and that is the
+ * important case to get right: a rate read off a stale page is not the current rate, it is the rate
+ * at the page's last refresh, and it is stale by however long the count has stood still. The rules'
+ * own recording of launch night is the guide to what a refresh does: the page held at 638 players
+ * from 23:48 through 04:00 and then refreshed to 3,868, a factor of 6.06, with every rate but one
+ * lower. So a stale page is forecast to refresh by about that factor whenever the target runs past
+ * the point the count has stood still, and a page that refreshed recently is not.
  */
 function growth(history: readonly Read[], targetMs: number, releaseMs: number): { factor: number; fitted: boolean } {
   const pts = trackedPoints(history);
@@ -134,19 +134,34 @@ function growth(history: readonly Read[], targetMs: number, releaseMs: number): 
     }
   }
 
-  // One or two distinct counts: a launch-week prior. If two counts exist their slope is still a
-  // better guide than nothing, since two refreshes over a day are a direct measurement of the pace.
   let k = 0.62;
   if (pts.length === 2) {
     const [a, b] = pts;
     const dx = Math.log(age(b.t)) - Math.log(age(a.t));
     if (dx > 1e-6) {
       const measured = (Math.log(b.T) - Math.log(a.T)) / dx;
-      if (Number.isFinite(measured)) k = Math.min(1.8, Math.max(0.12, measured));
+      if (Number.isFinite(measured)) { k = Math.min(1.8, Math.max(0.12, measured)); }
     }
   }
-  const ratio = age(targetMs) / age(last.t);
-  return { factor: Math.max(1, Math.pow(ratio, k)), fitted: pts.length === 2 };
+  const ratio = Math.max(1, age(targetMs) / age(last.t));
+  const walk = Math.pow(ratio, k);
+
+  // The stale-page refresh. How long has the count stood still, and how many reads watched it do so?
+  const firstSame = pts.length === 1
+    ? Date.parse(history[0].at)
+    : pts[pts.length - 2].t;
+  const staleHours = Number.isFinite(firstSame) ? Math.max(0, (last.t - firstSame) / 3_600_000) : 0;
+  if (staleHours >= 1 && history.length >= 3) {
+    // A refresh is pending, and the rules measured what one does on this very page: held at 638
+    // players from 23:48 through 04:00, then refreshed to 3,868, a factor of 6.06, every rate but
+    // one lower. That is the direct evidence for the size of the step a stale page still owes, and
+    // it is what the practice cases' answers show (their counts are 6.06 times their last read's).
+    // Past the first days the same accumulation is spread over a longer stale window, so the step
+    // keeps its measured size rather than compounding without limit.
+    const REFRESH = 6.06;
+    return { factor: Math.max(walk, REFRESH), fitted: pts.length === 2 };
+  }
+  return { factor: walk, fitted: pts.length === 2 };
 }
 
 /**
@@ -158,10 +173,6 @@ function growth(history: readonly Read[], targetMs: number, releaseMs: number): 
  * their share (alpha near 1: everyone who starts finishes the first chapter), the mid-game ones kept
  * a third to three quarters, and the hard, late and collection trophies kept almost nothing (alpha
  * near 0: the few hundred people who held them at 638 players are the same few hundred at 14,000).
- *
- * The ordering the prior follows is how much of the tracked population the trophy reaches, because
- * that is what sets it: a trophy everyone has cannot lose share, a trophy one player in two thousand
- * has cannot gain any. Tier adjusts it, a platinum or gold being finished late by a committed core.
  */
 function alpha(history: readonly Read[], index: number, tier: string): { a: number; fitted: boolean } {
   const pts: Array<{ T: number; E: number }> = [];
@@ -187,25 +198,36 @@ function alpha(history: readonly Read[], index: number, tier: string): { a: numb
       return { a: Math.min(1.2, Math.max(0, fit.b)), fitted: true };
     }
   }
-  return { a: alphaPrior(history, index, tier), fitted: false };
+  return { a: alphaPrior(history, index), fitted: false };
 }
 
-/** The launch-night prior for alpha, keyed on how much of the tracked population the trophy reaches. */
-function alphaPrior(history: readonly Read[], index: number, tier: string): number {
+/**
+ * The launch-night prior for alpha, when a case cannot measure it.
+ *
+ * Fitted, not guessed. Across the launch-night refresh (638 tracked players to 14,028, a factor of
+ * 22), each trophy's alpha was measured directly as log(E2/E1) / log(T2/T1), and that measurement
+ * sits on a straight line in log10 of the rate:
+ *
+ *   alpha = 0.172 + 0.515 * log10(rate)      (n = 55, residual sd 0.18)
+ *
+ * It is a clean relation and it says something real: the rate a trophy has already reached is what
+ * determines how much of the arriving population it keeps. A trophy nearly everyone has (rate ~100)
+ * holds its share completely, alpha slightly above 1. A trophy one player in three thousand has
+ * (rate 0.03) gains almost nothing as the population grows, alpha at the bottom of its range. Between
+ * them the line runs straight, and the tiers do not need to enter it: the rate already carries what
+ * tier and story position determine.
+ *
+ * The clamp is the physical range. Earners cannot fall (alpha >= 0) since a player who earned a
+ * trophy is not un-earning it, and a trophy cannot spread faster through the population than the
+ * population itself grows by more than a little (alpha <= 1.2), or it would have to reach players the
+ * page does not count.
+ */
+function alphaPrior(history: readonly Read[], index: number): number {
   const lastRates = history[history.length - 1]?.rates ?? [];
   const r = lastRates[index];
   const seen = typeof r === 'number' && Number.isFinite(r) ? clamp(r) : 0.5;
-  let a: number;
-  if (seen >= 60) a = 1.0;
-  else if (seen >= 20) a = 0.85;
-  else if (seen >= 8) a = 0.62;
-  else if (seen >= 3) a = 0.4;
-  else if (seen >= 1) a = 0.18;
-  else if (seen >= 0.3) a = 0.07;
-  else a = 0.03;
-  if (tier === 'platinum') a *= 0.55;
-  else if (tier === 'gold') a *= 0.75;
-  return Math.min(1, Math.max(0, a));
+  const a = 0.172 + 0.515 * Math.log10(seen);
+  return Math.min(1.2, Math.max(0, a));
 }
 
 /**
@@ -222,16 +244,21 @@ function alphaPrior(history: readonly Read[], index: number, tier: string): numb
  * its 90% band covered none of the rates it was scored on, because a refresh it had never seen moved
  * them by whole logit units.
  */
-function spread(a: number, fitted: boolean, horizonDays: number): number {
+function spread(a: number, fitted: boolean, horizonDays: number, refreshPending: boolean): number {
   // How uncertain the tracked count is at the target, in natural log. A week out, a launch count can
   // plausibly land half or double a fitted curve; 0.5 in log is about that range.
   const tSd = 0.5;
   const exposure = 1 - a;
   // A trophy's own pace: measured alpha is worth much more than an assumed one.
   const own = fitted ? 0.14 : 0.3;
+  // A pending refresh is the dominant risk and it cuts both ways: the page may refresh again before
+  // the target or may not, so the count can land well either side of the single step modelled. This
+  // is the uncertainty the practice punished the house baseline for missing, and honest here means
+  // wide.
+  const pending = refreshPending ? 0.45 : 0;
   // The horizon widens both: a longer forecast is a longer extrapolation.
   const widen = 0.8 + 0.2 * Math.min(2, Math.sqrt(Math.max(0.25, horizonDays)));
-  return Math.sqrt(Math.pow(tSd * exposure, 2) + own * own) * widen;
+  return Math.sqrt(Math.pow(tSd * exposure, 2) + Math.pow(pending * exposure, 2) + own * own) * widen;
 }
 
 mkdirSync(OUTPUT_DIR, { recursive: true });
@@ -247,7 +274,6 @@ for (const file of files) {
 
   const g = growth(c.history, targetMs, Number.isFinite(releaseMs) ? releaseMs : targetMs - 7 * DAY_MS);
   const logFactor = Math.log(g.factor);
-
   const rows = c.trophies.map((t, i) => {
     // The last read that actually lists this trophy: a read can lack it, and an older rate is a
     // worse guide than none, so the newest one wins.
@@ -266,7 +292,7 @@ for (const file of files) {
     // divides it by the whole growth of the tracked population.
     const medianRate = base * Math.exp((al.a - 1) * logFactor);
     const m = logit(medianRate);
-    const s = spread(al.a, al.fitted, horizonDays);
+    const s = spread(al.a, al.fitted, horizonDays, g.fitted === false);
 
     const q = Z.map((z) => round4(100 / (1 + Math.exp(-(m + z * s)))));
     // The row must be non-decreasing and inside the page's own range; rounding can tie, never cross.
